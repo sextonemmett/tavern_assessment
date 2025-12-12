@@ -2200,6 +2200,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pyaml"
+version = "25.7.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/01/41f63d66a801a561c9e335523516bd5f761bc43cc61f8b75918306bf2da8/pyaml-25.7.0.tar.gz", hash = "sha256:e113a64ec16881bf2b092e2beb84b7dcf1bd98096ad17f5f14e8fb782a75d99b", size = 29814, upload-time = "2025-07-10T18:44:51.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/ee/a878f2ad010cbccb311f947f0f2f09d38f613938ee28c34e60fceecc75a1/pyaml-25.7.0-py3-none-any.whl", hash = "sha256:ce5d7867cc2b455efdb9b0448324ff7b9f74d99f64650f12ca570102db6b985f", size = 26418, upload-time = "2025-07-10T18:44:50.679Z" },
+]
+
+[[package]]
 name = "pyarrow"
 version = "22.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2885,6 +2897,26 @@ wheels = [
 ]
 
 [[package]]
+name = "scikit-optimize"
+version = "0.10.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
+    { name = "pyaml" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b3/95/1b433b9eb9eb653fb97fd525552fd027886e3812d7d20d843994263340aa/scikit_optimize-0.10.2.tar.gz", hash = "sha256:00a3d91bf9015e292b6e7aaefe7e6cb95e8d25ce19adafd2cd88849e1a0b0da0", size = 86202, upload-time = "2024-06-04T19:12:56.879Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/cd/15c9ebea645cc9860aa71fe0474f4be981f10ed8e19e1fb0ef1027d4966e/scikit_optimize-0.10.2-py2.py3-none-any.whl", hash = "sha256:45bc7e879b086133984721f2f6735a86c085073f6c481c2ec665b5c67b44d723", size = 107794, upload-time = "2024-06-04T19:12:54.592Z" },
+]
+
+[[package]]
 name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3163,6 +3195,7 @@ dependencies = [
     { name = "requests" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scikit-optimize" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sentence-transformers" },
@@ -3182,6 +3215,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "requests", specifier = ">=2.25.0" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
+    { name = "scikit-optimize", specifier = ">=0.10.2" },
     { name = "scipy", specifier = ">=1.15.3" },
     { name = "sentence-transformers", specifier = ">=5.2.0" },
     { name = "statsmodels", specifier = ">=0.14.6" },

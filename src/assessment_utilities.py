@@ -6,7 +6,6 @@ This file contains helper functions that candidates can use during the assessmen
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Dict, List, Union, Tuple, Optional
 import requests
 import os
@@ -15,6 +14,17 @@ import json
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 import torch
+from sklearn.decomposition import PCA
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import roc_auc_score
+from xgboost import XGBClassifier
+from collections import Counter
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer
 
 # Skeleton functions for candidates to implement
 
@@ -22,10 +32,11 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the raw input dataframe into a feature-engineered dataframe ready for modeling.
     
-    This function should:
-    1. Perform any necessary data cleaning
-    2. Create all features needed for your model
-    3. Handle any text processing using assessment_utilities.py functions
+    Steps included here:
+    1. Clean obvious data issues that were noted in the assessment prompt.
+    2. Encode categorical variables (previous votes + favorability).
+    3. Aggregate to the video_id x partisanship grain, compute treatment effects,
+       and attach text-derived features.
     
     Args:
         df (pd.DataFrame): Raw input dataframe with original variables
@@ -33,10 +44,213 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         pd.DataFrame: Dataframe with all features needed for the model
     """
-    # Your feature engineering code here
-    # ...
+    if df is None or df.empty:
+        raise ValueError("compute_features received an empty dataframe.")
     
-    return df  # Replace with your engineered dataframe
+    print(f"[compute_features] start: input shape={df.shape}")
+    working_df = df.copy()
+    
+    # Fix mis-coded approval values.
+    invalid_trump_values = working_df["trump_approval"] == 11
+    if invalid_trump_values.any():
+        print(f"Corrected {invalid_trump_values.sum()} trump_approval values from 11 to 1.")
+        working_df.loc[invalid_trump_values, "trump_approval"] = 1
+    else:
+        print("[compute_features] trump_approval: no 11 values found")
+    
+    # Drop video 55 rows where metadata is entirely missing.
+    missing_video_mask = working_df["video_id"].eq(55)
+    if missing_video_mask.any():
+        print(f"Dropping video 55 rows due to missing text/maxdiff/sample_size ({missing_video_mask.sum()} rows).")
+        working_df = working_df.loc[~missing_video_mask].copy()
+    else:
+        print("[compute_features] video 55: no rows found")
+    
+    # One-hot encode presidential vote history.
+    print("[compute_features] encoding vote history (one-hot)")
+    vote_feature_cols: List[str] = []
+    for vote_col in ["vote_pres_2020", "vote_pres_2024"]:
+        cleaned = (
+            working_df[vote_col]
+            .fillna("Unknown")
+            .astype(str)
+            .str.strip()
+        )
+        working_df[vote_col] = cleaned
+        dummies = pd.get_dummies(cleaned, prefix=vote_col, dtype=float)
+        vote_feature_cols.extend(dummies.columns.tolist())
+        working_df = pd.concat([working_df, dummies], axis=1)
+    
+    # Favorability responses -> ordinal scores.
+    print("[compute_features] encoding favorability (ordinal)")
+    def encode_favorability(value: Optional[str]) -> Optional[float]:
+        if pd.isna(value):
+            return np.nan
+        normalized = str(value).strip().lower()
+        if not normalized:
+            return np.nan
+        normalized = normalized.replace("-", " ")
+        if "not sure" in normalized or "never heard" in normalized:
+            return 0
+        if "very favorable" in normalized:
+            return 2
+        if "somewhat favorable" in normalized:
+            return 1
+        if "very unfavorable" in normalized:
+            return -2
+        if "somewhat unfavorable" in normalized:
+            return -1
+        return np.nan
+    
+    favorability_cols = [
+        "democratic_party_fav",
+        "republican_party_fav",
+        "trump_fav",
+        "biden_fav",
+    ]
+    favorability_feature_cols: List[str] = []
+    for col in favorability_cols:
+        score_col = f"{col}_score"
+        working_df[score_col] = working_df[col].apply(encode_favorability)
+        favorability_feature_cols.append(score_col)
+    
+    working_df["video_id"] = working_df["video_id"].astype("Int64")
+    
+    print("[compute_features] computing control means by partisanship")
+    control_df = working_df[working_df["treated"] == 0]
+    control_means = (
+        control_df.groupby("partisanship")["trump_approval"]
+        .mean()
+        .rename("control_trump_approval")
+        .reset_index()
+    )
+    
+    treatment_df = working_df[working_df["treated"] == 1].copy()
+    if treatment_df.empty:
+        raise ValueError("No treated rows were found in the dataframe.")
+    print(f"[compute_features] treated rows={len(treatment_df):,}, control rows={len(control_df):,}")
+    
+    group_cols = ["video_id", "partisanship"]
+    
+    print("[compute_features] aggregating to video_id × partisanship")
+    agg_specs = {
+        "treatment_trump_approval": ("trump_approval", "mean"),
+        "n_participants": ("trump_approval", "size"),
+        "avg_persuadability": ("persuadability_score", "mean"),
+    }
+    for col in favorability_feature_cols:
+        agg_specs[f"avg_{col}"] = (col, "mean")
+    for col in vote_feature_cols:
+        agg_specs[f"{col}_share"] = (col, "mean")
+    
+    grouped = treatment_df.groupby(group_cols).agg(**agg_specs).reset_index()
+    grouped = grouped.merge(control_means, on="partisanship", how="left")
+    grouped["average_treatment_effect"] = (
+        grouped["treatment_trump_approval"] - grouped["control_trump_approval"]
+    )
+    grouped["increased_trump_approval"] = (grouped["average_treatment_effect"] > 0).astype(int)
+    print(f"[compute_features] grouped shape={grouped.shape}, positives={int(grouped['increased_trump_approval'].sum())}")
+    
+    print("[compute_features] building per-video metadata + text PCA features")
+    video_meta = (
+        treatment_df[["video_id", "text", "maxdiff_mean", "sample_size"]]
+        .drop_duplicates(subset=["video_id"])
+        .reset_index(drop=True)
+    )
+    text_pca_cols = [f"text_pca_{i+1}" for i in range(5)]
+    text_pca_features = compute_text_embedding_pca(video_meta[["video_id", "text"]], n_components=len(text_pca_cols))
+    video_meta = video_meta.merge(text_pca_features, on="video_id", how="left")
+    
+    print("[compute_features] merging aggregated outcomes with video metadata/features")
+    features_df = grouped.merge(video_meta, on="video_id", how="left")
+    
+    # Preserve a consistent column order so downstream modeling is predictable.
+    ordered_cols = [
+        "video_id",
+        "partisanship",
+        "text",
+        "maxdiff_mean",
+        "sample_size",
+        "n_participants",
+        "avg_persuadability",
+        "treatment_trump_approval",
+        "control_trump_approval",
+        "average_treatment_effect",
+        "increased_trump_approval",
+    ]
+    ordered_cols += text_pca_cols
+    remaining_cols = [col for col in features_df.columns if col not in ordered_cols]
+    features_df = features_df[ordered_cols + remaining_cols]
+    
+    print(f"[compute_features] done: output shape={features_df.shape}")
+    return features_df
+
+
+def compute_text_embedding_pca(
+    texts: Union[pd.Series, List[str], pd.DataFrame],
+    n_components: int = 5
+) -> pd.DataFrame:
+    """
+    Generate PCA-based summary features from treatment video text embeddings.
+    
+    Args:
+        texts: Either a Series/List of text strings or a DataFrame with 'video_id' and 'text'.
+        n_components: Number of principal components to return.
+        
+    Returns:
+        DataFrame containing 'video_id' (if provided) plus the PCA score columns.
+    """
+    if n_components <= 0:
+        raise ValueError("n_components must be a positive integer.")
+    
+    print(f"[compute_text_embedding_pca] start: n_components={n_components}")
+    video_ids: Optional[pd.Series] = None
+    if isinstance(texts, pd.DataFrame):
+        if "text" not in texts.columns or "video_id" not in texts.columns:
+            raise ValueError("DataFrame input must include 'video_id' and 'text' columns.")
+        video_ids = texts["video_id"].reset_index(drop=True)
+        text_series = texts["text"].reset_index(drop=True)
+    else:
+        text_series = pd.Series(texts)
+    
+    text_series = text_series.fillna("").astype(str)
+    print(f"[compute_text_embedding_pca] embedding {len(text_series):,} texts")
+    embeddings = get_embeddings(text_series.tolist())
+    n_rows, n_dims = embeddings.shape
+    
+    component_cols = [f"text_pca_{i+1}" for i in range(n_components)]
+    component_df = pd.DataFrame(
+        np.zeros((n_rows, n_components)),
+        index=text_series.index,
+        columns=component_cols,
+    )
+    
+    if n_rows == 0:
+        return _attach_video_id(component_df, video_ids)
+    
+    effective_components = min(n_components, n_rows, n_dims)
+    if effective_components == 0:
+        return _attach_video_id(component_df, video_ids)
+    
+    print(f"[compute_text_embedding_pca] running PCA with {effective_components} components on dim={n_dims}")
+    pca = PCA(n_components=effective_components)
+    transformed = pca.fit_transform(embeddings)
+    for idx in range(effective_components):
+        component_df.iloc[:, idx] = transformed[:, idx]
+    
+    print("[compute_text_embedding_pca] done")
+    return _attach_video_id(component_df, video_ids)
+
+
+def _attach_video_id(component_df: pd.DataFrame, video_ids: Optional[pd.Series]) -> pd.DataFrame:
+    """
+    Helper to insert video_id column when available.
+    """
+    if video_ids is None:
+        return component_df.reset_index(drop=True)
+    result = component_df.copy()
+    result.insert(0, "video_id", video_ids.values)
+    return result
 
 
 def predict_increased_trump_approval(df: pd.DataFrame) -> np.ndarray:
@@ -57,16 +271,178 @@ def predict_increased_trump_approval(df: pd.DataFrame) -> np.ndarray:
     Returns:
         np.ndarray: Mean and standard deviation of AUC across folds
     """
+    print("[predict_increased_trump_approval] start")
     # Step 1: Generate features
     features_df = compute_features(df)
+    print(f"[predict_increased_trump_approval] compute_features done: shape={features_df.shape}")
     
-    # Step 2: Apply any necessary transformations (scaling, etc.)
-    # Your transformation code here
-    # ...
+    target_col = "increased_trump_approval"
+    if target_col not in features_df.columns:
+        raise ValueError(f"Expected '{target_col}' to be present in compute_features output.")
     
-    # Step 3: Train and evaluate a model
-    # Your modeling code here
-    # ...
+    y = features_df[target_col].astype(int).to_numpy()
+    groups = features_df["video_id"].astype(int).to_numpy()
+    
+    # Stratify by partisanship × target so each fold reflects subgroup base rates.
+    stratify_labels = (
+        features_df["partisanship"].astype(str) + "__" + features_df[target_col].astype(int).astype(str)
+    ).to_numpy()
+    
+    # Exclude leakage-prone or non-feature columns.
+    drop_cols = {
+        "video_id",
+        "text",
+        target_col,
+        "average_treatment_effect",
+        "treatment_trump_approval",
+        "control_trump_approval",
+    }
+    feature_df = features_df.drop(columns=[c for c in drop_cols if c in features_df.columns])
+    print(f"[predict_increased_trump_approval] feature matrix: shape={feature_df.shape}")
+    
+    categorical_cols = ["partisanship"] if "partisanship" in feature_df.columns else []
+    numeric_cols = [c for c in feature_df.columns if c not in categorical_cols]
+
+    if feature_df.isna().any().any():
+        na_cols = feature_df.columns[feature_df.isna().any()].tolist()
+        raise ValueError(
+            f"Missing values detected in feature matrix (columns: {na_cols}). "
+            "Either clean upstream in compute_features or re-enable imputation."
+        )
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "categorical",
+                OneHotEncoder(handle_unknown="ignore"),
+                categorical_cols,
+            ),
+            (
+                "numeric",
+                "passthrough",
+                numeric_cols,
+            ),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+    
+    model = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+        tree_method="hist",
+    )
+    
+    clf = Pipeline(steps=[("preprocess", preprocessor), ("model", model)])
+    
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_aucs: List[float] = []
+    oof_proba = np.full(shape=(len(feature_df),), fill_value=np.nan, dtype=float)
+    fold_aucs_by_partisanship: Dict[str, List[float]] = {}
+    best_params_per_fold: List[Dict[str, object]] = []
+
+    # More-thorough tuning while respecting dataset size (~378 rows) and grouped CV:
+    # Bayesian optimization via scikit-optimize (BayesSearchCV).
+    bayes_space = {
+        "model__max_depth": Integer(2, 6),
+        "model__learning_rate": Real(1e-2, 2e-1, prior="log-uniform"),
+        "model__n_estimators": Integer(150, 800),
+        "model__min_child_weight": Integer(1, 10),
+        "model__subsample": Real(0.6, 1.0),
+        "model__colsample_bytree": Real(0.6, 1.0),
+        "model__gamma": Real(0.0, 5.0),
+        "model__reg_alpha": Real(0.0, 1.0),
+        "model__reg_lambda": Real(0.5, 5.0, prior="log-uniform"),
+    }
+    search_iters = 30
+    print(f"[predict_increased_trump_approval] starting outer CV: n_splits={cv.get_n_splits()}")
+    
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(feature_df, stratify_labels, groups=groups), start=1):
+        print(f"[predict_increased_trump_approval] fold {fold_idx}: split train={len(train_idx):,} test={len(test_idx):,}")
+        X_train = feature_df.iloc[train_idx]
+        y_train = y[train_idx]
+        X_test = feature_df.iloc[test_idx]
+        y_test = y[test_idx]
+
+        groups_train = groups[train_idx]
+        stratify_train = stratify_labels[train_idx]
+
+        inner_cv = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
+        inner_splits = list(inner_cv.split(X_train, stratify_train, groups=groups_train))
+        print(f"[predict_increased_trump_approval] fold {fold_idx}: bayes search start (iters={search_iters}, inner_splits={len(inner_splits)})")
+
+        search = BayesSearchCV(
+            estimator=clf,
+            search_spaces=bayes_space,
+            n_iter=search_iters,
+            scoring="roc_auc",
+            cv=inner_splits,
+            n_jobs=-1,
+            refit=True,
+            random_state=42,
+            error_score="raise",
+        )
+        search.fit(X_train, y_train)
+        best_params_per_fold.append(search.best_params_)
+        print(f"Fold {fold_idx} best params: {search.best_params_} (inner AUC: {search.best_score_:.4f})")
+
+        best_clf = search.best_estimator_
+        y_proba = best_clf.predict_proba(X_test)[:, 1]
+        oof_proba[test_idx] = y_proba
+        
+        if len(np.unique(y_test)) < 2:
+            raise ValueError(
+                f"Fold {fold_idx} has only one class in y_test; adjust CV strategy or n_splits."
+            )
+        auc = roc_auc_score(y_test, y_proba)
+        fold_aucs.append(float(auc))
+        print(f"Fold {fold_idx} AUC: {auc:.4f}")
+
+        # per-partisanship AUC within this fold.
+        for partisanship in sorted(features_df["partisanship"].astype(str).unique().tolist()):
+            mask = features_df.iloc[test_idx]["partisanship"].astype(str).eq(partisanship).to_numpy()
+            if not mask.any():
+                continue
+            y_sub = y_test[mask]
+            if len(np.unique(y_sub)) < 2:
+                continue
+            auc_sub = roc_auc_score(y_sub, y_proba[mask])
+            fold_aucs_by_partisanship.setdefault(partisanship, []).append(float(auc_sub))
+    
+    mean_auc = float(np.mean(fold_aucs))
+    std_auc = float(np.std(fold_aucs, ddof=1)) if len(fold_aucs) > 1 else 0.0
+    print(f"Mean AUC: {mean_auc:.4f} (std: {std_auc:.4f})")
+
+    if best_params_per_fold:
+        params_counter = Counter([tuple(sorted(p.items())) for p in best_params_per_fold])
+        most_common_params, count = params_counter.most_common(1)[0]
+        print(f"Most common best params across folds (n={count}): {dict(most_common_params)}")
+
+    # Per-partisanship AUC on out-of-fold predictions (each row predicted once).
+    if np.isnan(oof_proba).any():
+        raise ValueError("OOF predictions contain NaNs; CV split may have failed to cover all rows.")
+    for partisanship in sorted(features_df["partisanship"].astype(str).unique().tolist()):
+        mask = features_df["partisanship"].astype(str).eq(partisanship).to_numpy()
+        y_sub = y[mask]
+        if len(np.unique(y_sub)) < 2:
+            print(f"{partisanship} OOF AUC: undefined (single class).")
+            continue
+        auc_oof = roc_auc_score(y_sub, oof_proba[mask])
+        print(f"{partisanship} OOF AUC: {auc_oof:.4f}")
+
+    # If available, also summarize fold-wise subgroup AUCs.
+    for partisanship, aucs in fold_aucs_by_partisanship.items():
+        if len(aucs) < 2:
+            continue
+        print(
+            f"{partisanship} fold AUC mean: {float(np.mean(aucs)):.4f} "
+            f"(std: {float(np.std(aucs, ddof=1)):.4f}, n_folds: {len(aucs)})"
+        )
+    
+    return np.array([mean_auc, std_auc])
     
 
 def load_data(file_path: str) -> pd.DataFrame:
@@ -96,7 +472,7 @@ def get_embeddings(texts: List[str]) -> np.ndarray:
     # Do not change the model name and cache directory
     model_name = 'paraphrase-MiniLM-L3-v2'
     embedding_dim = 384
-    cache_dir = 'cached_embeddings'
+    cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "cached_embeddings"))
  
     # Create cache directory if it doesn't exist
     os.makedirs(cache_dir, exist_ok=True)
@@ -139,261 +515,8 @@ def get_embeddings(texts: List[str]) -> np.ndarray:
     
     return all_embeddings
 
-def call_llama(prompt: str, 
-               system_prompt: str = "You are a helpful AI assistant.",
-               temperature: float = 0.1, 
-               max_tokens: int = 1000,
-               timeout: int = 60,
-               expected_format: str = "text",
-               debug: bool = False,
-               **kwargs) -> str:
-    """
-    Call a local Llama 3.2 model with a prompt using Ollama API.
-    
-    Args:
-        prompt: The user prompt to send to the model
-        system_prompt: System prompt to set context for the model
-        temperature: Controls randomness (0.0 = deterministic, 1.0 = creative)
-        max_tokens: Maximum number of tokens to generate
-        timeout: Maximum time to wait for API response in seconds
-        expected_format: Type of response expected:
-            - 'text': Any non-empty text (default)
-            - 'number': A numeric value (will be extracted from response)
-            - 'word': A single word (first word will be extracted if multiple)
-            - 'category': A value from a predefined list (requires valid_categories kwarg)
-            - 'binary': A yes/no response (will normalize variations)
-        debug: Whether to print detailed debug information
-        **kwargs: Additional keyword arguments:
-            - valid_categories: List of valid categories (required for 'category' format)
-        
-    Returns:
-        Model's response as a string, formatted according to expected_format
-    """
-    import json
-    import time
-    
-    if debug:
-        print(f"\n[DEBUG] call_llama: Starting with prompt: '{prompt[:50]}...'")
-        print(f"[DEBUG] call_llama: Using model: llama3.2, timeout: {timeout}s")
-    
-    start_time = time.time()
-    
-    try:
-        # Set up the API endpoint for Ollama
-        API_URL = "http://localhost:11434/api/chat"
-        
-        # Prepare the request payload
-        payload = {
-            "model": "llama3.2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "options": {
-                "temperature": temperature,
-                "num_predict": max_tokens
-            }
-        }
-        
-        if debug:
-            print(f"[DEBUG] call_llama: Sending request to {API_URL}")
-            print(f"[DEBUG] call_llama: Payload: {json.dumps(payload)[:100]}...")
-        
-        # Make the API call with timeout
-        try:
-            response = requests.post(API_URL, json=payload, timeout=timeout)
-            response.raise_for_status()  # Raise an exception for HTTP errors
-        except requests.exceptions.Timeout:
-            error_msg = f"Timeout error: Ollama API did not respond within {timeout} seconds"
-            print(error_msg)
-            return f"Error: {error_msg}"
-        except requests.exceptions.ConnectionError:
-            error_msg = "Connection error: Could not connect to Ollama API. Is Ollama running?"
-            print(error_msg)
-            return f"Error: {error_msg}"
-        except requests.exceptions.HTTPError as e:
-            error_msg = f"HTTP error: {e}"
-            print(error_msg)
-            return f"Error: {error_msg}"
- 
-        # Parse the response - handle streaming response format
-        response_text = response.text
-        
-        if debug:
-            print(f"[DEBUG] call_llama: Received response in {time.time() - start_time:.2f}s")
-            print(f"[DEBUG] call_llama: Response text: {response_text[:200]}...")
-        
-        # Ollama returns multiple JSON objects - we need to find the one with content
-        lines = response_text.strip().split('\n')
-        content = None
-        
-        # First try to find any JSON object with non-empty content
-        for line in lines:
-            try:
-                obj = json.loads(line)
-                # Check if this object has a non-empty message content
-                line_content = obj.get("message", {}).get("content")
-                if line_content:
-                    content = line_content
-                    break
-            except json.JSONDecodeError:
-                if debug:
-                    print(f"[DEBUG] call_llama: Could not parse line as JSON: {line[:50]}...")
-                continue
-        
-        # If we didn't find any content, try to parse the first object
-        if not content:
-            try:
-                first_obj = json.loads(lines[0]) if lines else {}
-                content = first_obj.get("message", {}).get("content", "")
-            except (json.JSONDecodeError, IndexError):
-                if debug:
-                    print("[DEBUG] call_llama: Could not parse first line as JSON")
-                # If all else fails, use the raw response
-                content = response_text.strip()
-        
-        # Validate the response format if expected_format is provided
-        if expected_format and content:
-            if expected_format == 'number':
-                # Try to convert to a number
-                try:
-                    # Strip any non-numeric characters
-                    numeric_content = ''.join(c for c in content if c.isdigit() or c == '.')
-                    float(numeric_content)  # Just to validate
-                    content = numeric_content
-                    if debug:
-                        print(f"[DEBUG] call_llama: Validated numeric response: {content}")
-                except ValueError:
-                    error_msg = f"Response validation error: Expected a number but got '{content}'"
-                    print(error_msg)
-                    if debug:
-                        print(f"[DEBUG] call_llama: {error_msg}")
-                    return f"Error: {error_msg}"
-            
-            elif expected_format == 'word':
-                # Check if the response is a single word (no spaces, punctuation allowed)
-                content = content.strip()
-                if ' ' in content:
-                    # Extract just the first word
-                    first_word = content.split()[0].strip()
-                    if debug:
-                        print(f"[DEBUG] call_llama: Expected single word but got multiple. Using first word: '{first_word}'")
-                    content = first_word
-                
-                # Remove any punctuation at the beginning or end
-                content = content.strip('.,;:!?"\'-()[]{}')
-                if debug:
-                    print(f"[DEBUG] call_llama: Validated word response: '{content}'")
-            
-            elif expected_format == 'category':
-                # This requires a valid_categories list to be passed in the kwargs
-                if 'valid_categories' not in kwargs:
-                    error_msg = "Response validation error: 'valid_categories' must be provided for 'category' format"
-                    print(error_msg)
-                    return f"Error: {error_msg}"
-                
-                valid_categories = kwargs['valid_categories']
-                content = content.strip().lower()
-                
-                # Direct match
-                if content in [c.lower() for c in valid_categories]:
-                    # Find the original case version
-                    for c in valid_categories:
-                        if c.lower() == content:
-                            content = c
-                            break
-                    if debug:
-                        print(f"[DEBUG] call_llama: Validated category response: '{content}'")
-                else:
-                    # Try to find a partial match or match with spaces removed
-                    content_nospaces = ''.join(content.split())
-                    best_match = None
-                    best_score = 0
-                    
-                    for category in valid_categories:
-                        # Check for exact match with spaces removed
-                        category_nospaces = ''.join(category.lower().split())
-                        if content_nospaces == category_nospaces:
-                            best_match = category
-                            break
-                        
-                        # Check if the content is contained within the category
-                        if content in category.lower():
-                            # Score based on length ratio
-                            score = len(content) / len(category.lower())
-                            if score > best_score:
-                                best_score = score
-                                best_match = category
-                    
-                    if best_match and best_score > 0.5:  # Require at least 50% match
-                        content = best_match
-                        if debug:
-                            print(f"[DEBUG] call_llama: Fuzzy matched category '{content_nospaces}' to '{best_match}'")
-                    else:
-                        options = ", ".join(valid_categories)
-                        error_msg = f"Response validation error: '{content}' is not a valid category. Valid options: {options}"
-                        print(error_msg)
-                        if debug:
-                            print(f"[DEBUG] call_llama: {error_msg}")
-                        return f"Error: {error_msg}"
-            
-            elif expected_format == 'binary':
-                # Special case for yes/no responses
-                content = content.strip().lower()
-                
-                # Direct match
-                if content in ['yes', 'no']:
-                    if debug:
-                        print(f"[DEBUG] call_llama: Validated binary response: '{content}'")
-                else:
-                    # Try to match variations
-                    if content in ['y', 'yeah', 'yep', 'yea', 'affirmative', 'correct', 'true', '1']:
-                        content = 'yes'
-                        if debug:
-                            print(f"[DEBUG] call_llama: Normalized binary response to 'yes'")
-                    elif content in ['n', 'nope', 'nah', 'negative', 'incorrect', 'false', '0']:
-                        content = 'no'
-                        if debug:
-                            print(f"[DEBUG] call_llama: Normalized binary response to 'no'")
-                    else:
-                        error_msg = f"Response validation error: '{content}' is not a valid binary response. Use 'yes' or 'no'."
-                        print(error_msg)
-                        if debug:
-                            print(f"[DEBUG] call_llama: {error_msg}")
-                        return f"Error: {error_msg}"
-            
-            elif expected_format == 'text':
-                # For text format, just ensure it's a non-empty string and trim whitespace
-                content = content.strip()
-                if not content:
-                    error_msg = "Response validation error: Expected non-empty text but got empty response"
-                    print(error_msg)
-                    if debug:
-                        print(f"[DEBUG] call_llama: {error_msg}")
-                    return f"Error: {error_msg}"
-                if debug:
-                    print(f"[DEBUG] call_llama: Validated text response: '{content[:50]}...'")
-            
-            else:
-                # Unknown format
-                if debug:
-                    print(f"[DEBUG] call_llama: Unknown expected_format '{expected_format}', returning raw content")
-        
-        if not content:
-            error_msg = "No content returned from Ollama API"
-            print(error_msg)
-            return f"Error: {error_msg}"
-        
-        if debug:
-            print(f"[DEBUG] call_llama: Successfully extracted content: '{content}'")
-            print(f"[DEBUG] call_llama: Total processing time: {time.time() - start_time:.2f}s")
-        
-        return content
-    
-    except Exception as e:
-        error_msg = f"Unexpected error calling Ollama API: {str(e)}"
-        print(error_msg)
-        if debug:
-            import traceback
-            print(f"[DEBUG] call_llama: Exception details:\n{traceback.format_exc()}")
-        return f"Error: {error_msg}"
+
+if __name__ == "__main__":
+    df = load_data("./data/full_dataset.csv")
+    results = predict_increased_trump_approval(df)
+    print(results)
