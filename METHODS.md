@@ -20,7 +20,7 @@ Steps:
 
 The assessment specifies computing an average treatment effect (ATE) for each `video_id × partisanship` group as:
 
-`ATE(video_id, partisanship) = mean(trump_approval | treated video_id, partisanship) - mean(trump_approval | control, partisanship)` fileciteturn1file0L15-L20
+`ATE(video_id, partisanship) = mean(trump_approval | treated video_id, partisanship) - mean(trump_approval | control, partisanship)`
 
 Implementation details:
 
@@ -57,7 +57,7 @@ In `predict_increased_trump_approval`, the feature set is explicitly restricted 
 - `avg_persuadability`, `maxdiff_mean` (numeric)
 - `embedding_*` (text embeddings)
 
-This adheres to the constraint that features be computable from: `video_id`, `partisanship`, `persuadability_score`, transcript `text`, and `maxdiff_mean`. fileciteturn1file0L25-L27
+This adheres to the constraint that features be computable from: `video_id`, `partisanship`, `persuadability_score`, transcript `text`, and `maxdiff_mean`.
 
 ## 4) Data splitting strategy
 
