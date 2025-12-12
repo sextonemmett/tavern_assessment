@@ -1,10 +1,10 @@
 # Methods
 
-This document describes the modeling workflow implemented in `assessment_utilities.py` to predict whether a treatment video increases Trump approval (relative to control) for each partisanship class, using only features computable from the provided inputs. fileciteturn1file0L10-L31
+This document describes the modeling workflow implemented in `assessment_utilities.py` to predict whether a treatment video increases Trump approval (relative to control) for each partisanship class, using only features computable from the provided inputs.
 
 ## 1) Data preparation and cleansing
 
-All preparation happens inside `compute_features(df)` and is designed to output one row per `video_id × partisanship` group. fileciteturn1file0L33-L41
+All preparation happens inside `compute_features(df)` and is designed to output one row per `video_id × partisanship` group.
 
 Steps:
 
@@ -27,7 +27,7 @@ Implementation details:
 - **Control baseline:** compute `control_trump_approval` as the mean of `trump_approval` among control observations within each partisanship group.
 - **Treatment mean:** compute `treatment_trump_approval` as the mean of `trump_approval` among treated observations for each `video_id × partisanship`.
 - **ATE:** `average_treatment_effect = treatment_trump_approval - control_trump_approval`.
-- **Binary label:** create `increased_trump_approval = 1` if `average_treatment_effect > 0`, else `0`. fileciteturn1file0L18-L20
+- **Binary label:** create `increased_trump_approval = 1` if `average_treatment_effect > 0`, else `0`. 
 
 Notes / caveats:
 
@@ -67,7 +67,7 @@ Evaluation is designed to reflect the out-of-sample goal: generalizing to unseen
   - **Groups:** `video_id`, so the same video cannot appear in both train and test within a fold (prevents leakage through text / maxdiff features).
   - **Stratification label:** `partisanship × increased_trump_approval`, to better preserve subgroup class balance across folds.
 
-This implements a grouped, stratified CV consistent with the prompt’s requirement to use stratified K-fold and report AUC mean/std across folds. fileciteturn1file0L21-L25
+This implements a grouped, stratified CV consistent with the prompt’s requirement to use stratified K-fold and report AUC mean/std across folds.
 
 ## 5) Model selection and hyperparameter tuning
 
@@ -108,7 +108,7 @@ Caveats:
 
 Primary metric:
 
-- **AUC (ROC AUC)** computed on each outer-fold test split, then summarized as mean and standard deviation across folds. fileciteturn1file0L23-L25
+- **AUC (ROC AUC)** computed on each outer-fold test split, then summarized as mean and standard deviation across folds.
 
 Additional diagnostics (printed, not required by the prompt):
 
