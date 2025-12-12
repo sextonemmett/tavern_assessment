@@ -30,19 +30,37 @@ from skopt.space import Real, Integer
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Transform the raw input dataframe into a feature-engineered dataframe ready for modeling.
-    
-    Steps included here:
-    1. Clean obvious data issues that were noted in the assessment prompt.
-    2. Encode categorical variables (previous votes + favorability).
-    3. Aggregate to the video_id x partisanship grain, compute treatment effects,
-       and attach text-derived features.
-    
+    Build group-level modeling features for the assessment.
+
+    The output is aggregated to the `video_id × partisanship` grain (one row per
+    treatment video and partisanship class), and includes:
+    - `control_trump_approval`: mean approval in the control group for that partisanship
+    - `treatment_trump_approval`: mean approval among treated participants for that video/partisanship
+    - `average_treatment_effect`: treatment minus control
+    - `increased_trump_approval`: 1 if treatment effect > 0 else 0
+    - `avg_persuadability`: mean `persuadability_score` for that video/partisanship (treated only)
+    - `maxdiff_mean`: video-level maxdiff score (treated videos)
+    - `embedding_0..embedding_383`: SentenceTransformer embedding of the video transcript text
+
+    Data cleaning performed (per assessment notes):
+    - Recode `trump_approval == 11` to 1
+    - Drop `video_id == 55` (missing text/maxdiff metadata)
+
+    Notes:
+    - Embeddings are computed from `text` via `get_embeddings()` and cached on disk.
+    - This function prints progress messages to stdout.
+
     Args:
-        df (pd.DataFrame): Raw input dataframe with original variables
+        df: Raw participant-level dataframe for Experiment 1, containing both treated
+            and control rows plus per-video metadata. Expected columns include
+            `treated`, `trump_approval`, `video_id`, `partisanship`,
+            `persuadability_score`, `text`, and `maxdiff_mean`.
             
     Returns:
-        pd.DataFrame: Dataframe with all features needed for the model
+        DataFrame at `video_id × partisanship` grain with target + modeling features.
+
+    Raises:
+        ValueError: If `df` is empty or contains no treated rows.
     """
     if df is None or df.empty:
         raise ValueError("compute_features received an empty dataframe.")
@@ -66,54 +84,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         print("[compute_features] video 55: no rows found")
     
-    # One-hot encode presidential vote history.
-    print("[compute_features] encoding vote history (one-hot)")
-    vote_feature_cols: List[str] = []
-    for vote_col in ["vote_pres_2020", "vote_pres_2024"]:
-        cleaned = (
-            working_df[vote_col]
-            .fillna("Unknown")
-            .astype(str)
-            .str.strip()
-        )
-        working_df[vote_col] = cleaned
-        dummies = pd.get_dummies(cleaned, prefix=vote_col, dtype=float)
-        vote_feature_cols.extend(dummies.columns.tolist())
-        working_df = pd.concat([working_df, dummies], axis=1)
-    
-    # Favorability responses -> ordinal scores.
-    print("[compute_features] encoding favorability (ordinal)")
-    def encode_favorability(value: Optional[str]) -> Optional[float]:
-        if pd.isna(value):
-            return np.nan
-        normalized = str(value).strip().lower()
-        if not normalized:
-            return np.nan
-        normalized = normalized.replace("-", " ")
-        if "not sure" in normalized or "never heard" in normalized:
-            return 0
-        if "very favorable" in normalized:
-            return 2
-        if "somewhat favorable" in normalized:
-            return 1
-        if "very unfavorable" in normalized:
-            return -2
-        if "somewhat unfavorable" in normalized:
-            return -1
-        return np.nan
-    
-    favorability_cols = [
-        "democratic_party_fav",
-        "republican_party_fav",
-        "trump_fav",
-        "biden_fav",
-    ]
-    favorability_feature_cols: List[str] = []
-    for col in favorability_cols:
-        score_col = f"{col}_score"
-        working_df[score_col] = working_df[col].apply(encode_favorability)
-        favorability_feature_cols.append(score_col)
-    
     working_df["video_id"] = working_df["video_id"].astype("Int64")
     
     print("[compute_features] computing control means by partisanship")
@@ -135,13 +105,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     print("[compute_features] aggregating to video_id × partisanship")
     agg_specs = {
         "treatment_trump_approval": ("trump_approval", "mean"),
-        "n_participants": ("trump_approval", "size"),
         "avg_persuadability": ("persuadability_score", "mean"),
     }
-    for col in favorability_feature_cols:
-        agg_specs[f"avg_{col}"] = (col, "mean")
-    for col in vote_feature_cols:
-        agg_specs[f"{col}_share"] = (col, "mean")
     
     grouped = treatment_df.groupby(group_cols).agg(**agg_specs).reset_index()
     grouped = grouped.merge(control_means, on="partisanship", how="left")
@@ -151,15 +116,17 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     grouped["increased_trump_approval"] = (grouped["average_treatment_effect"] > 0).astype(int)
     print(f"[compute_features] grouped shape={grouped.shape}, positives={int(grouped['increased_trump_approval'].sum())}")
     
-    print("[compute_features] building per-video metadata + text PCA features")
+    print("[compute_features] building per-video metadata + text embeddings")
     video_meta = (
-        treatment_df[["video_id", "text", "maxdiff_mean", "sample_size"]]
+        treatment_df[["video_id", "text", "maxdiff_mean"]]
         .drop_duplicates(subset=["video_id"])
         .reset_index(drop=True)
     )
-    text_pca_cols = [f"text_pca_{i+1}" for i in range(5)]
-    text_pca_features = compute_text_embedding_pca(video_meta[["video_id", "text"]], n_components=len(text_pca_cols))
-    video_meta = video_meta.merge(text_pca_features, on="video_id", how="left")
+    video_meta["text"] = video_meta["text"].fillna("")
+    embeddings = get_embeddings(video_meta["text"].astype(str).tolist())
+    embedding_cols = [f"embedding_{i}" for i in range(embeddings.shape[1])]
+    embedding_frame = pd.DataFrame(embeddings, columns=embedding_cols)
+    video_meta = pd.concat([video_meta.reset_index(drop=True), embedding_frame], axis=1)
     
     print("[compute_features] merging aggregated outcomes with video metadata/features")
     features_df = grouped.merge(video_meta, on="video_id", how="left")
@@ -170,15 +137,13 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         "partisanship",
         "text",
         "maxdiff_mean",
-        "sample_size",
-        "n_participants",
         "avg_persuadability",
         "treatment_trump_approval",
         "control_trump_approval",
         "average_treatment_effect",
         "increased_trump_approval",
     ]
-    ordered_cols += text_pca_cols
+    ordered_cols += embedding_cols
     remaining_cols = [col for col in features_df.columns if col not in ordered_cols]
     features_df = features_df[ordered_cols + remaining_cols]
     
@@ -191,14 +156,22 @@ def compute_text_embedding_pca(
     n_components: int = 5
 ) -> pd.DataFrame:
     """
-    Generate PCA-based summary features from treatment video text embeddings.
-    
+    Compute PCA scores from SentenceTransformer embeddings of text.
+
+    This helper is useful for exploratory feature creation, but note that it fits PCA
+    on *all provided rows*. For leakage-safe modeling, prefer fitting PCA inside the
+    cross-validation pipeline (as done in `predict_increased_trump_approval`).
+
     Args:
-        texts: Either a Series/List of text strings or a DataFrame with 'video_id' and 'text'.
-        n_components: Number of principal components to return.
+        texts: Either a Series/List of text strings or a DataFrame with `video_id` and `text`.
+        n_components: Number of PCA components to compute.
         
     Returns:
-        DataFrame containing 'video_id' (if provided) plus the PCA score columns.
+        DataFrame containing PCA score columns (`text_pca_1..text_pca_k`) and, when
+        the input is a DataFrame, a `video_id` column for alignment.
+
+    Raises:
+        ValueError: If `n_components <= 0` or DataFrame input is missing required columns.
     """
     if n_components <= 0:
         raise ValueError("n_components must be a positive integer.")
@@ -244,7 +217,7 @@ def compute_text_embedding_pca(
 
 def _attach_video_id(component_df: pd.DataFrame, video_ids: Optional[pd.Series]) -> pd.DataFrame:
     """
-    Helper to insert video_id column when available.
+    Insert a `video_id` column when available.
     """
     if video_ids is None:
         return component_df.reset_index(drop=True)
@@ -255,21 +228,35 @@ def _attach_video_id(component_df: pd.DataFrame, video_ids: Optional[pd.Series])
 
 def predict_increased_trump_approval(df: pd.DataFrame) -> np.ndarray:
     """
-    End-to-end function that transforms the raw input dataframe into a feature-engineered dataframe
-    ready for modeling and then trains and evaluates an XGBoost classifier with cross-validation.
-    
-    This function should:
-    1. Call compute_features() to transform the raw input dataframe into a 
-       feature-engineered dataframe ready for modeling.
-    2. Apply any transformations needed (e.g., scaling)
-    3. Train an XGBoost classifier and evaluate it with cross-validation, reporting
-       the mean and standard deviation of AUC across folds.
-    
+    Train/evaluate an XGBoost classifier to predict `increased_trump_approval`.
+
+    Workflow:
+    1. Calls `compute_features(df)` to create a `video_id × partisanship` dataset.
+    2. Restricts the modeling feature set to variables computable from the assessment's
+       allowed inputs: `video_id`, `partisanship`, `persuadability_score`, `text`,
+       and `maxdiff_mean`:
+       - `partisanship` (categorical, one-hot encoded)
+       - `avg_persuadability` and `maxdiff_mean` (numeric)
+       - `embedding_*` reduced to 5 dimensions via PCA fit inside CV
+    3. Evaluates with leakage-safe cross-validation:
+       - Outer CV: `StratifiedGroupKFold` grouping by `video_id` and stratifying on
+         `partisanship × target` to preserve subgroup class balance
+       - Inner CV (per outer fold): Bayesian hyperparameter tuning via `BayesSearchCV`
+         using the same grouped/stratified split strategy
+
+    Output/side effects:
+    - Prints progress, best hyperparameters per fold, fold AUCs, mean/std AUC,
+      plus per-partisanship AUC on out-of-fold predictions.
+
     Args:
-        df (pd.DataFrame): Raw input dataframe with original variables
+        df: Raw participant-level dataframe.
             
     Returns:
-        np.ndarray: Mean and standard deviation of AUC across folds
+        NumPy array `[mean_auc, std_auc]` across outer folds.
+
+    Raises:
+        ValueError: If required columns are missing, features contain missing values,
+            or a fold contains only one target class.
     """
     print("[predict_increased_trump_approval] start")
     # Step 1: Generate features
@@ -310,18 +297,27 @@ def predict_increased_trump_approval(df: pd.DataFrame) -> np.ndarray:
             "Either clean upstream in compute_features or re-enable imputation."
         )
     
+    embedding_cols = [c for c in feature_df.columns if c.startswith("embedding_")]
+    allowed_feature_cols = ["partisanship", "avg_persuadability", "maxdiff_mean"] + embedding_cols
+    missing_allowed = [c for c in allowed_feature_cols if c not in feature_df.columns]
+    if missing_allowed:
+        raise ValueError(f"Expected allowed feature columns missing from compute_features output: {missing_allowed}")
+
+    # Restrict model features to those allowed by the prompt.
+    feature_df = feature_df[allowed_feature_cols]
+    categorical_cols = ["partisanship"]
+    non_embedding_numeric_cols = ["avg_persuadability", "maxdiff_mean"]
+
+    print(
+        f"[predict_increased_trump_approval] using allowed features only: "
+        f"{len(non_embedding_numeric_cols)} numeric + {len(embedding_cols)} embeddings + partisanship"
+    )
+
     preprocessor = ColumnTransformer(
         transformers=[
-            (
-                "categorical",
-                OneHotEncoder(handle_unknown="ignore"),
-                categorical_cols,
-            ),
-            (
-                "numeric",
-                "passthrough",
-                numeric_cols,
-            ),
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
+            ("numeric", "passthrough", non_embedding_numeric_cols),
+            ("embed_pca", PCA(n_components=5, svd_solver="randomized", random_state=42), embedding_cols),
         ],
         remainder="drop",
         verbose_feature_names_out=False,
@@ -450,24 +446,31 @@ def load_data(file_path: str) -> pd.DataFrame:
     Load the dataset from a CSV file.
     
     Args:
-        file_path: Path to the CSV file
+        file_path: Path to the CSV file.
         
     Returns:
-        DataFrame containing the dataset
+        DataFrame containing the dataset.
     """
     return pd.read_csv(file_path)
 
 
 def get_embeddings(texts: List[str]) -> np.ndarray:
     """
-    Get embeddings for a list of texts using Sentence Transformers.
-    Uses a caching system to avoid recomputing embeddings for texts that have been processed before.
+    Compute SentenceTransformer embeddings for a list of texts with on-disk caching.
+
+    - Model is fixed to `paraphrase-MiniLM-L3-v2` (do not change).
+    - Embeddings are cached in `data/cached_embeddings` by an MD5 hash of the text.
+    - Empty/None/blank strings return a zero vector.
+
+    Notes:
+    - The first run may download model artifacts (network access may be required).
+    - Subsequent runs reuse cached embeddings on disk.
     
     Args:
-        texts: List of text strings to embed
+        texts: List of text strings to embed.
         
     Returns:
-        NumPy array of embeddings
+        NumPy array of shape `(len(texts), 384)`.
     """
     # Do not change the model name and cache directory
     model_name = 'paraphrase-MiniLM-L3-v2'
@@ -514,9 +517,3 @@ def get_embeddings(texts: List[str]) -> np.ndarray:
             np.save(cache_file, embedding)
     
     return all_embeddings
-
-
-if __name__ == "__main__":
-    df = load_data("./data/full_dataset.csv")
-    results = predict_increased_trump_approval(df)
-    print(results)
